@@ -509,91 +509,107 @@ def index():
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    if 'wrong_rates_pdf' not in request.files or 'manual_pdf' not in request.files:
-        return jsonify({'error': 'Both PDF files are required'}), 400
-    
-    wrong_rates_file = request.files['wrong_rates_pdf']
-    manual_file = request.files['manual_pdf']
-    
-    wrong_rates_path = os.path.join(app.config['UPLOAD_FOLDER'], 'wrong_rates.pdf')
-    manual_path = os.path.join(app.config['UPLOAD_FOLDER'], 'manual.pdf')
-    
-    wrong_rates_file.save(wrong_rates_path)
-    manual_file.save(manual_path)
-    
     try:
-        high_error_questions = extract_wrong_answer_rates(wrong_rates_path)
-        all_questions = high_error_questions['60-79'] + high_error_questions['80+']
-        question_info = extract_question_info(manual_path, all_questions)
+        if 'wrong_rates_pdf' not in request.files or 'manual_pdf' not in request.files:
+            return jsonify({'error': 'Both PDF files are required'}), 400
         
-        questions_60_79 = {q: question_info[q] for q in high_error_questions['60-79']}
-        questions_80_plus = {q: question_info[q] for q in high_error_questions['80+']}
+        wrong_rates_file = request.files['wrong_rates_pdf']
+        manual_file = request.files['manual_pdf']
         
-        teaching_points = generate_teaching_points(questions_60_79, questions_80_plus)
+        if not wrong_rates_file.filename or not manual_file.filename:
+            return jsonify({'error': 'Both PDF files must be selected'}), 400
         
-        # Prepare statistics
-        subcategory_stats = {'60-79': {}, '80+': {}}
-        general_category_stats = {'60-79': {}, '80+': {}}  # New stats for general categories
-        population_stats = {'60-79': {}, '80+': {}}
+        wrong_rates_path = os.path.join(app.config['UPLOAD_FOLDER'], 'wrong_rates.pdf')
+        manual_path = os.path.join(app.config['UPLOAD_FOLDER'], 'manual.pdf')
         
-        # Process categories for 60-79% questions
-        for q_num in high_error_questions['60-79']:
-            if isinstance(question_info[q_num], dict):
-                # Subcategory statistics
-                subcategory = question_info[q_num]['subcategory']
-                if subcategory:
-                    subcategory_stats['60-79'][subcategory] = subcategory_stats['60-79'].get(subcategory, 0) + 1
-                
-                # General category statistics
-                general_category = question_info[q_num]['general_category']
-                if general_category:
-                    general_category_stats['60-79'][general_category] = general_category_stats['60-79'].get(general_category, 0) + 1
-                
-                # Population statistics
-                category = question_info[q_num]['category']
-                pop_type = 'Adult' if 'ADULT' in category else 'Pediatric' if 'PEDIATRIC' in category else 'Not Specified'
-                population_stats['60-79'][pop_type] = population_stats['60-79'].get(pop_type, 0) + 1
+        try:
+            wrong_rates_file.save(wrong_rates_path)
+            manual_file.save(manual_path)
+        except Exception as e:
+            return jsonify({'error': f'Error saving files: {str(e)}'}), 500
         
-        # Process categories for 80+% questions
-        for q_num in high_error_questions['80+']:
-            if isinstance(question_info[q_num], dict):
-                # Subcategory statistics
-                subcategory = question_info[q_num]['subcategory']
-                if subcategory:
-                    subcategory_stats['80+'][subcategory] = subcategory_stats['80+'].get(subcategory, 0) + 1
-                
-                # General category statistics
-                general_category = question_info[q_num]['general_category']
-                if general_category:
-                    general_category_stats['80+'][general_category] = general_category_stats['80+'].get(general_category, 0) + 1
-                
-                # Population statistics
-                category = question_info[q_num]['category']
-                pop_type = 'Adult' if 'ADULT' in category else 'Pediatric' if 'PEDIATRIC' in category else 'Not Specified'
-                population_stats['80+'][pop_type] = population_stats['80+'].get(pop_type, 0) + 1
-        
-        result = {
-            'stats': {
-                '60-79': len(high_error_questions['60-79']),
-                '80+': len(high_error_questions['80+']),
-                'categories': subcategory_stats,
-                'general_categories': general_category_stats,  # Add general categories to response
-                'population': population_stats
-            },
-            'teaching_points': teaching_points,
-            'questions_60_79': questions_60_79,
-            'questions_80_plus': questions_80_plus
-        }
-        
-        return jsonify(result)
-        
+        try:
+            high_error_questions = extract_wrong_answer_rates(wrong_rates_path)
+            if not isinstance(high_error_questions, dict) or '60-79' not in high_error_questions or '80+' not in high_error_questions:
+                return jsonify({'error': 'Invalid format in wrong answer rates extraction'}), 500
+            
+            all_questions = high_error_questions['60-79'] + high_error_questions['80+']
+            if not all_questions:
+                return jsonify({'error': 'No questions found with high error rates'}), 400
+            
+            question_info = extract_question_info(manual_path, all_questions)
+            if not isinstance(question_info, dict):
+                return jsonify({'error': 'Invalid question information format'}), 500
+            
+            questions_60_79 = {q: question_info[q] for q in high_error_questions['60-79']}
+            questions_80_plus = {q: question_info[q] for q in high_error_questions['80+']}
+            
+            teaching_points = generate_teaching_points(questions_60_79, questions_80_plus)
+            
+            # Initialize statistics
+            stats = {
+                'subcategory_stats': {'60-79': {}, '80+': {}},
+                'general_category_stats': {'60-79': {}, '80+': {}},
+                'population_stats': {'60-79': {}, '80+': {}}
+            }
+            
+            # Process categories for both ranges
+            for range_key in ['60-79', '80+']:
+                questions = high_error_questions[range_key]
+                for q_num in questions:
+                    if q_num in question_info and isinstance(question_info[q_num], dict):
+                        info = question_info[q_num]
+                        
+                        # Subcategory statistics
+                        if info.get('subcategory'):
+                            stats['subcategory_stats'][range_key][info['subcategory']] = \
+                                stats['subcategory_stats'][range_key].get(info['subcategory'], 0) + 1
+                        
+                        # General category statistics
+                        if info.get('general_category'):
+                            stats['general_category_stats'][range_key][info['general_category']] = \
+                                stats['general_category_stats'][range_key].get(info['general_category'], 0) + 1
+                        
+                        # Population statistics
+                        category = info.get('category', '')
+                        pop_type = 'Adult' if 'ADULT' in category else 'Pediatric' if 'PEDIATRIC' in category else 'Not Specified'
+                        stats['population_stats'][range_key][pop_type] = \
+                            stats['population_stats'][range_key].get(pop_type, 0) + 1
+            
+            result = {
+                'stats': {
+                    '60-79': len(high_error_questions['60-79']),
+                    '80+': len(high_error_questions['80+']),
+                    'categories': stats['subcategory_stats'],
+                    'general_categories': stats['general_category_stats'],
+                    'population': stats['population_stats']
+                },
+                'teaching_points': teaching_points if teaching_points else "No teaching points generated",
+                'questions_60_79': questions_60_79,
+                'questions_80_plus': questions_80_plus
+            }
+            
+            # Validate the result before sending
+            json.dumps(result)  # This will raise an error if the result is not JSON-serializable
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            print(f"Error processing PDFs: {str(e)}")
+            return jsonify({'error': f'Error processing PDFs: {str(e)}'}), 500
+            
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Unexpected error: {str(e)}")
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        
     finally:
-        if os.path.exists(wrong_rates_path):
-            os.remove(wrong_rates_path)
-        if os.path.exists(manual_path):
-            os.remove(manual_path)
+        # Clean up uploaded files
+        for path in [wrong_rates_path, manual_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                print(f"Error removing temporary file {path}: {str(e)}")
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
