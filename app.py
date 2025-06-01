@@ -2,7 +2,7 @@ import os
 from flask import Flask, render_template, request, jsonify
 import PyPDF2
 import pandas as pd
-from openai import OpenAI
+import openai
 from dotenv import load_dotenv
 import re
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -12,8 +12,8 @@ from pathlib import Path
 
 load_dotenv()
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Initialize OpenAI API key
+openai.api_key = os.getenv('OPENAI_API_KEY')
 
 # Cache configuration
 CACHE_DIR = Path('cache')
@@ -189,7 +189,6 @@ def extract_general_category(pdf_reader, page_num):
     return "Uncategorized"
 
 def extract_question_info(pdf_path, question_numbers):
-    # Remove the client initialization here since we're using the global one
     question_info = {}
     
     # Read the PDF to get page categories regardless of cache
@@ -418,7 +417,7 @@ def extract_question_info(pdf_path, question_numbers):
             )
             
             try:
-                response = client.chat.completions.create(
+                response = openai.ChatCompletion.create(
                     model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.5,
@@ -469,7 +468,7 @@ def extract_question_info(pdf_path, question_numbers):
 
 def generate_teaching_points(question_info_60_79, question_info_80_plus):
     """Generate key teaching points based on question summaries."""
-    # Remove the client initialization here since we're using the global one
+    # Combine all summaries
     all_summaries = []
     for questions in [question_info_60_79, question_info_80_plus]:
         for info in questions.values():
@@ -479,7 +478,6 @@ def generate_teaching_points(question_info_60_79, question_info_80_plus):
     if not all_summaries:
         return []
 
-    # Use OpenAI to analyze summaries and generate teaching points
     prompt = f"""As a chief resident, analyze these question summaries from commonly missed RITE exam questions and provide key teaching points. Focus on:
 1. Common themes and patterns
 2. Critical knowledge gaps
@@ -492,7 +490,7 @@ Summaries to analyze:
 Provide a concise, bullet-pointed list of 5-7 key teaching points that would be most valuable for chief residents."""
 
     try:
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
