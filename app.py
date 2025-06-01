@@ -195,17 +195,21 @@ def extract_general_category(pdf_reader, page_num):
 
 def extract_question_info(pdf_path, question_numbers):
     question_info = {}
+    full_text = ""  # Initialize full_text variable
     
     try:
-        # Read the PDF to get page categories
+        # Read the PDF to get page categories and full text
         page_categories = {}
         with open(pdf_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
+            # Extract full text first
             for page_num in range(len(pdf_reader.pages)):
                 try:
+                    page = pdf_reader.pages[page_num]
+                    full_text += f"[PAGE {page_num + 1}]\n{page.extract_text()}\n"
                     page_categories[page_num] = extract_general_category(pdf_reader, page_num)
                 except Exception as e:
-                    print(f"Warning: Error extracting category from page {page_num + 1}: {str(e)}")
+                    print(f"Warning: Error extracting text from page {page_num + 1}: {str(e)}")
                     page_categories[page_num] = "Uncategorized"
         
         # Process questions in smaller batches to manage memory
