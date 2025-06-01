@@ -195,32 +195,43 @@ def extract_general_category(pdf_reader, page_num):
 
 def extract_question_info(pdf_path, question_numbers):
     question_info = {}
-    full_text = ""  # Initialize full_text variable
     
     try:
         # Read the PDF to get page categories and full text
         page_categories = {}
+        full_text = ""
+        
+        # Process PDF in smaller chunks to manage memory
         with open(pdf_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
-            # Extract full text first
-            for page_num in range(len(pdf_reader.pages)):
-                try:
-                    page = pdf_reader.pages[page_num]
-                    full_text += f"[PAGE {page_num + 1}]\n{page.extract_text()}\n"
-                    page_categories[page_num] = extract_general_category(pdf_reader, page_num)
-                except Exception as e:
-                    print(f"Warning: Error extracting text from page {page_num + 1}: {str(e)}")
-                    page_categories[page_num] = "Uncategorized"
+            total_pages = len(pdf_reader.pages)
+            
+            # Process pages in chunks of 10
+            for chunk_start in range(0, total_pages, 10):
+                chunk_end = min(chunk_start + 10, total_pages)
+                chunk_text = ""
+                
+                for page_num in range(chunk_start, chunk_end):
+                    try:
+                        page = pdf_reader.pages[page_num]
+                        chunk_text += f"[PAGE {page_num + 1}]\n{page.extract_text()}\n"
+                        page_categories[page_num] = extract_general_category(pdf_reader, page_num)
+                    except Exception as e:
+                        print(f"Warning: Error extracting text from page {page_num + 1}: {str(e)}")
+                        page_categories[page_num] = "Uncategorized"
+                
+                full_text += chunk_text
+                # Force garbage collection after each chunk
+                gc.collect()
         
-        # Process questions in smaller batches to manage memory
-        batch_size = 10
+        # Process questions in even smaller batches
+        batch_size = 5  # Reduced from 10 to 5
         for i in range(0, len(question_numbers), batch_size):
             batch = question_numbers[i:i + batch_size]
             
             for q_num in batch:
                 try:
                     # Process question and generate summary
-                    # More specific pattern matching for question numbers
                     patterns = [
                         f"Question #{q_num}\\s+[A-Z]",
                         f"\\n{q_num}\\s+[A-Z]",
@@ -371,10 +382,6 @@ def extract_question_info(pdf_path, question_numbers):
                     
                     question_info[q_num] = result
                     
-                    # Force garbage collection after each batch
-                    if (i + 1) % batch_size == 0:
-                        gc.collect()
-                        
                 except Exception as e:
                     print(f"Error processing question {q_num}: {str(e)}")
                     error_result = {

@@ -8,7 +8,7 @@ backlog = 2048
 workers = 1  # Single worker for memory-intensive tasks
 worker_class = 'sync'
 worker_connections = 1000
-timeout = 300  # 5 minutes timeout
+timeout = 600  # Increased to 10 minutes
 keepalive = 2
 
 # Process naming
@@ -32,8 +32,13 @@ group = None
 tmp_upload_dir = None
 
 # Memory management
-max_requests = 1000
-max_requests_jitter = 50
+max_requests = 1
+max_requests_jitter = 0
+
+# Worker configuration
+worker_tmp_dir = '/dev/shm'  # Use memory for temporary files
+worker_max_requests = 1  # Restart workers after each request to clear memory
+worker_max_requests_jitter = 0
 
 # Misc
 reload = False
