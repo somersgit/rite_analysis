@@ -9,16 +9,28 @@ from werkzeug.exceptions import RequestEntityTooLarge
 import json
 import hashlib
 from pathlib import Path
+import gc  # For garbage collection
 
 load_dotenv()
 
 # Initialize OpenAI API key
 openai.api_key = os.getenv('OPENAI_API_KEY')
+openai.api_base = "https://api.openai.com/v1"
+openai.timeout = 30  # 30 seconds timeout for API calls
 
 # Cache configuration
 CACHE_DIR = Path('cache')
 CACHE_DIR.mkdir(exist_ok=True)
 SUMMARIES_CACHE_FILE = CACHE_DIR / 'summaries_cache.json'
+
+# Upload folder configuration
+UPLOAD_FOLDER = 'uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024  # 64MB max file size
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 def get_pdf_fingerprint(pdf_path):
     """Generate a fingerprint for the first page of the PDF."""
@@ -53,13 +65,6 @@ def save_cache(cache_data):
 
 # Initialize cache
 summaries_cache = load_cache()
-
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024  # 64MB max file size
-app.config['UPLOAD_FOLDER'] = 'uploads'
-
-# Ensure upload folder exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 def clean_text(text):
     """Clean up text by fixing common PDF formatting issues."""
@@ -191,280 +196,197 @@ def extract_general_category(pdf_reader, page_num):
 def extract_question_info(pdf_path, question_numbers):
     question_info = {}
     
-    # Read the PDF to get page categories regardless of cache
-    page_categories = {}
-    with open(pdf_path, 'rb') as file:
-        pdf_reader = PyPDF2.PdfReader(file)
-        for page_num in range(len(pdf_reader.pages)):
-            try:
-                page_categories[page_num] = extract_general_category(pdf_reader, page_num)
-            except Exception as e:
-                print(f"Warning: Error extracting category from page {page_num + 1}: {str(e)}")
-                page_categories[page_num] = "Uncategorized"
-    
-    # Check if we have processed this PDF before
-    pdf_fingerprint = get_pdf_fingerprint(pdf_path)
-    cache_hit = False
-    
-    if pdf_fingerprint and pdf_fingerprint in summaries_cache:
-        print("\nFound cached summaries for this PDF!")
-        cached_data = summaries_cache[pdf_fingerprint]
-        # Check if all requested questions are in cache
-        all_cached = all(str(q_num) in cached_data for q_num in question_numbers)
+    try:
+        # Read the PDF to get page categories
+        page_categories = {}
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page_num in range(len(pdf_reader.pages)):
+                try:
+                    page_categories[page_num] = extract_general_category(pdf_reader, page_num)
+                except Exception as e:
+                    print(f"Warning: Error extracting category from page {page_num + 1}: {str(e)}")
+                    page_categories[page_num] = "Uncategorized"
         
-        if all_cached:
-            print("Using cached summaries for all questions")
-            # Create a new dictionary with updated general categories
-            updated_cache = {}
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                full_text = ""
-                for page_num in range(len(pdf_reader.pages)):
-                    try:
-                        page_text = pdf_reader.pages[page_num].extract_text()
-                        if page_text:
-                            full_text += f"\n[PAGE {page_num + 1}]\n" + page_text
-                    except Exception as e:
-                        continue
-                
-                for q_num in question_numbers:
-                    cached_question = cached_data[str(q_num)]
-                    if isinstance(cached_question, dict):
-                        # Find which page this question is on
-                        current_page = 0
-                        question_pattern = f"Question #{q_num}|\\n{q_num}\\s+[A-Z]"
-                        matches = list(re.finditer(question_pattern, full_text))
+        # Process questions in smaller batches to manage memory
+        batch_size = 10
+        for i in range(0, len(question_numbers), batch_size):
+            batch = question_numbers[i:i + batch_size]
+            
+            for q_num in batch:
+                try:
+                    # Process question and generate summary
+                    # More specific pattern matching for question numbers
+                    patterns = [
+                        f"Question #{q_num}\\s+[A-Z]",
+                        f"\\n{q_num}\\s+[A-Z]",
+                        f"^{q_num}\\s+[A-Z]",
+                        f"[^0-9]{q_num}\\s+[A-Z]"
+                    ]
+                    
+                    # Find the first matching pattern
+                    start_idx = -1
+                    matched_text = ""
+                    current_page = 0
+                    
+                    for pattern in patterns:
+                        matches = list(re.finditer(pattern, full_text))
                         if matches:
-                            pos = matches[0].start()
-                            page_markers = list(re.finditer(r'\[PAGE (\d+)\]', full_text[:pos]))
-                            if page_markers:
-                                current_page = int(page_markers[-1].group(1)) - 1
-                        
-                        # Add or update general category
-                        updated_question = dict(cached_question)
-                        updated_question['general_category'] = page_categories.get(current_page, "Uncategorized")
-                        updated_cache[q_num] = updated_question
+                            for match in matches:
+                                pos = match.start()
+                                # Find which page this question is on
+                                page_markers = list(re.finditer(r'\[PAGE (\d+)\]', full_text[:pos]))
+                                if page_markers:
+                                    current_page = int(page_markers[-1].group(1)) - 1
+                                
+                                next_q = re.search(r'Question #\d{1,3}|\\n\d{1,3}\\s+[A-Z]', full_text[pos+1:pos+500])
+                                if not next_q or (next_q and int(re.search(r'\d+', next_q.group()).group()) > q_num):
+                                    start_idx = pos
+                                    matched_text = match.group()
+                                    break
+                            if start_idx != -1:
+                                break
+                    
+                    if start_idx == -1:
+                        print(f"Warning: Question {q_num} not found with primary patterns, trying fallback patterns")
+                        fallback_patterns = [
+                            f"{q_num}\\s+",
+                            f"Question\\s+{q_num}",
+                            f"\\n{q_num}\\s+"
+                        ]
+                        for pattern in fallback_patterns:
+                            matches = list(re.finditer(pattern, full_text))
+                            if matches:
+                                start_idx = matches[0].start()
+                                matched_text = matches[0].group()
+                                # Find which page this question is on
+                                page_markers = list(re.finditer(r'\[PAGE (\d+)\]', full_text[:start_idx]))
+                                if page_markers:
+                                    current_page = int(page_markers[-1].group(1)) - 1
+                                break
+                    
+                    if start_idx == -1:
+                        print(f"Warning: Could not find content for Question {q_num}")
+                        question_info[q_num] = f"Question {q_num} information not found"
+                        continue
+                    
+                    # Rest of your existing question processing code...
+                    next_q_pattern = r'Question #\d{1,3}|\n\d{1,3}\s+[A-Z]|\[PAGE \d+\]'
+                    next_q_match = re.search(next_q_pattern, full_text[start_idx + len(matched_text):])
+                    
+                    if next_q_match:
+                        end_idx = start_idx + len(matched_text) + next_q_match.start()
                     else:
-                        # Handle error cases
-                        updated_cache[q_num] = {
-                            'category': 'Error',
-                            'subcategory': None,
-                            'general_category': 'Error',
-                            'content': cached_question,
-                            'reference': None,
-                            'summary': cached_question
-                        }
-            
-            return updated_cache
-        else:
-            print("Some questions not found in cache, will process missing questions")
-            # Use cached data for questions we have
-            question_info = {}
-            for q_num in question_numbers:
-                if str(q_num) in cached_data:
-                    cached_question = cached_data[str(q_num)]
-                    if isinstance(cached_question, dict):
-                        updated_question = dict(cached_question)
-                        # We'll update the general category later when processing the full text
-                        question_info[q_num] = updated_question
-            
-            # Only process questions we don't have
-            question_numbers = [q_num for q_num in question_numbers if str(q_num) not in cached_data]
-    
-    # Read the manual PDF
-    with open(pdf_path, 'rb') as file:
-        pdf_reader = PyPDF2.PdfReader(file)
-        full_text = ""
-        
-        for page_num in range(len(pdf_reader.pages)):
-            try:
-                page_text = pdf_reader.pages[page_num].extract_text()
-                if page_text:
-                    full_text += f"\n[PAGE {page_num + 1}]\n" + page_text
-            except Exception as e:
-                print(f"Warning: Error extracting text from page {page_num + 1}: {str(e)}")
-                continue
-    
-    if not full_text.strip():
-        raise Exception("Failed to extract any text from the PDF")
-    
-    # Process each question that wasn't in cache
-    newly_processed = {}
-    for q_num in question_numbers:
-        try:
-            # More specific pattern matching for question numbers
-            patterns = [
-                f"Question #{q_num}\\s+[A-Z]",
-                f"\\n{q_num}\\s+[A-Z]",
-                f"^{q_num}\\s+[A-Z]",
-                f"[^0-9]{q_num}\\s+[A-Z]"
-            ]
-            
-            # Find the first matching pattern
-            start_idx = -1
-            matched_text = ""
-            current_page = 0
-            
-            for pattern in patterns:
-                matches = list(re.finditer(pattern, full_text))
-                if matches:
-                    for match in matches:
-                        pos = match.start()
-                        # Find which page this question is on
-                        page_markers = list(re.finditer(r'\[PAGE (\d+)\]', full_text[:pos]))
-                        if page_markers:
-                            current_page = int(page_markers[-1].group(1)) - 1
+                        end_idx = len(full_text)
+                    
+                    question_text = full_text[start_idx:end_idx].strip()
+                    question_text = re.sub(r'\[PAGE \d+\]\s*', ' ', question_text)
+                    lines = [line.strip() for line in question_text.split('\n') if line.strip()]
+                    
+                    if not lines:
+                        print(f"Warning: No content found for Question {q_num}")
+                        question_info[q_num] = f"No content found for Question {q_num}"
+                        continue
+                    
+                    first_line = lines[0]
+                    category_text = re.sub(f'^(?:Question\\s+#{q_num}|{q_num})\\s*', '', first_line).strip()
+                    parts = [p.strip() for p in re.split(r'\s{2,}', category_text) if p.strip()]
+                    
+                    category_parts = []
+                    subcategory = None
+                    
+                    for part in parts:
+                        cleaned_part = clean_text(part)
+                        if cleaned_part.isupper() or any(phrase in cleaned_part for phrase in ["CORE KNOWLEDGE"]):
+                            category_parts.append(cleaned_part)
+                        elif not subcategory and cleaned_part[0].isupper():
+                            subcategory = cleaned_part
+                    
+                    category = " ".join(category_parts) if category_parts else "Category Not Found"
+                    
+                    if not subcategory and len(lines) > 1:
+                        second_line = clean_text(lines[1])
+                        if not second_line.isupper() and second_line[0].isupper():
+                            subcategory = second_line
+                    
+                    content_start = 2 if subcategory in lines[1:2] else 1
+                    content = " ".join(lines[content_start:])
+                    content = clean_text(content)
+                    
+                    if not content:
+                        print(f"Warning: No content extracted for Question {q_num}")
+                        content = "Content not found"
+                    
+                    reference = None
+                    ref_match = re.search(r'(?:Reference|References):\s*([^\n]+)', content, re.IGNORECASE)
+                    if ref_match:
+                        reference = clean_text(ref_match.group(1))
+                        content = clean_text(content[:ref_match.start()].strip())
+                    
+                    print(f"\nProcessing Question {q_num}:")
+                    print(f"Category: {category}")
+                    print(f"Subcategory: {subcategory}")
+                    print(f"Content length: {len(content)} characters")
+                    
+                    prompt = (
+                        f"You are analyzing a medical examination question. Based on the following information, provide a concise summary:\n\n"
+                        f"Question Number: {q_num}\n"
+                        f"Category: {category}\n"
+                        f"Subcategory: {subcategory}\n"
+                        f"Content: {content}\n\n"
+                        f"Please provide a brief, specific summary that covers:\n"
+                        f"1. The exact medical knowledge or concept being tested\n"
+                        f"2. Why this specific topic is important for medical residents\n"
+                        f"Keep the summary focused and under 100 words."
+                    )
+                    
+                    try:
+                        response = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.5,
+                            max_tokens=150
+                        )
                         
-                        next_q = re.search(r'Question #\d{1,3}|\\n\d{1,3}\\s+[A-Z]', full_text[pos+1:pos+500])
-                        if not next_q or (next_q and int(re.search(r'\d+', next_q.group()).group()) > q_num):
-                            start_idx = pos
-                            matched_text = match.group()
-                            break
-                    if start_idx != -1:
-                        break
-            
-            if start_idx == -1:
-                print(f"Warning: Question {q_num} not found with primary patterns, trying fallback patterns")
-                fallback_patterns = [
-                    f"{q_num}\\s+",
-                    f"Question\\s+{q_num}",
-                    f"\\n{q_num}\\s+"
-                ]
-                for pattern in fallback_patterns:
-                    matches = list(re.finditer(pattern, full_text))
-                    if matches:
-                        start_idx = matches[0].start()
-                        matched_text = matches[0].group()
-                        # Find which page this question is on
-                        page_markers = list(re.finditer(r'\[PAGE (\d+)\]', full_text[:start_idx]))
-                        if page_markers:
-                            current_page = int(page_markers[-1].group(1)) - 1
-                        break
-            
-            if start_idx == -1:
-                print(f"Warning: Could not find content for Question {q_num}")
-                question_info[q_num] = f"Question {q_num} information not found"
-                continue
-            
-            # Rest of your existing question processing code...
-            next_q_pattern = r'Question #\d{1,3}|\n\d{1,3}\s+[A-Z]|\[PAGE \d+\]'
-            next_q_match = re.search(next_q_pattern, full_text[start_idx + len(matched_text):])
-            
-            if next_q_match:
-                end_idx = start_idx + len(matched_text) + next_q_match.start()
-            else:
-                end_idx = len(full_text)
-            
-            question_text = full_text[start_idx:end_idx].strip()
-            question_text = re.sub(r'\[PAGE \d+\]\s*', ' ', question_text)
-            lines = [line.strip() for line in question_text.split('\n') if line.strip()]
-            
-            if not lines:
-                print(f"Warning: No content found for Question {q_num}")
-                question_info[q_num] = f"No content found for Question {q_num}"
-                continue
-            
-            first_line = lines[0]
-            category_text = re.sub(f'^(?:Question\\s+#{q_num}|{q_num})\\s*', '', first_line).strip()
-            parts = [p.strip() for p in re.split(r'\s{2,}', category_text) if p.strip()]
-            
-            category_parts = []
-            subcategory = None
-            
-            for part in parts:
-                cleaned_part = clean_text(part)
-                if cleaned_part.isupper() or any(phrase in cleaned_part for phrase in ["CORE KNOWLEDGE"]):
-                    category_parts.append(cleaned_part)
-                elif not subcategory and cleaned_part[0].isupper():
-                    subcategory = cleaned_part
-            
-            category = " ".join(category_parts) if category_parts else "Category Not Found"
-            
-            if not subcategory and len(lines) > 1:
-                second_line = clean_text(lines[1])
-                if not second_line.isupper() and second_line[0].isupper():
-                    subcategory = second_line
-            
-            content_start = 2 if subcategory in lines[1:2] else 1
-            content = " ".join(lines[content_start:])
-            content = clean_text(content)
-            
-            if not content:
-                print(f"Warning: No content extracted for Question {q_num}")
-                content = "Content not found"
-            
-            reference = None
-            ref_match = re.search(r'(?:Reference|References):\s*([^\n]+)', content, re.IGNORECASE)
-            if ref_match:
-                reference = clean_text(ref_match.group(1))
-                content = clean_text(content[:ref_match.start()].strip())
-            
-            print(f"\nProcessing Question {q_num}:")
-            print(f"Category: {category}")
-            print(f"Subcategory: {subcategory}")
-            print(f"Content length: {len(content)} characters")
-            
-            prompt = (
-                f"You are analyzing a medical examination question. Based on the following information, provide a concise summary:\n\n"
-                f"Question Number: {q_num}\n"
-                f"Category: {category}\n"
-                f"Subcategory: {subcategory}\n"
-                f"Content: {content}\n\n"
-                f"Please provide a brief, specific summary that covers:\n"
-                f"1. The exact medical knowledge or concept being tested\n"
-                f"2. Why this specific topic is important for medical residents\n"
-                f"Keep the summary focused and under 100 words."
-            )
-            
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.5,
-                    max_tokens=150
-                )
-                
-                summary = response.choices[0].message.content
-            except Exception as e:
-                print(f"Warning: Error generating summary for Question {q_num}: {str(e)}")
-                summary = "Error generating summary"
-            
-            # Get the general category for this question from the page it's on
-            general_category = page_categories.get(current_page, "Uncategorized")
-            
-            result = {
-                'category': category,
-                'subcategory': subcategory,
-                'general_category': general_category,  # Add the general category
-                'content': content,
-                'reference': reference,
-                'summary': summary
-            }
-            
-            question_info[q_num] = result
-            newly_processed[str(q_num)] = result
-            
-        except Exception as e:
-            print(f"Error processing question {q_num}: {str(e)}")
-            error_result = {
-                'category': 'Error',
-                'subcategory': None,
-                'general_category': 'Error',  # Add general category even for errors
-                'content': f"Error processing question: {str(e)}",
-                'reference': None,
-                'summary': 'Error processing question'
-            }
-            question_info[q_num] = error_result
-            newly_processed[str(q_num)] = error_result
-    
-    if pdf_fingerprint and newly_processed:
-        if pdf_fingerprint not in summaries_cache:
-            summaries_cache[pdf_fingerprint] = {}
-        summaries_cache[pdf_fingerprint].update(newly_processed)
-        save_cache(summaries_cache)
-        print(f"\nCached {len(newly_processed)} new question summaries")
-    
-    return question_info
+                        summary = response.choices[0].message.content
+                    except Exception as e:
+                        print(f"Warning: Error generating summary for Question {q_num}: {str(e)}")
+                        summary = "Error generating summary"
+                    
+                    # Get the general category for this question from the page it's on
+                    general_category = page_categories.get(current_page, "Uncategorized")
+                    
+                    result = {
+                        'category': category,
+                        'subcategory': subcategory,
+                        'general_category': general_category,  # Add the general category
+                        'content': content,
+                        'reference': reference,
+                        'summary': summary
+                    }
+                    
+                    question_info[q_num] = result
+                    
+                    # Force garbage collection after each batch
+                    if (i + 1) % batch_size == 0:
+                        gc.collect()
+                        
+                except Exception as e:
+                    print(f"Error processing question {q_num}: {str(e)}")
+                    error_result = {
+                        'category': 'Error',
+                        'subcategory': None,
+                        'general_category': 'Error',
+                        'content': f"Error processing question: {str(e)}",
+                        'reference': None,
+                        'summary': 'Error processing question'
+                    }
+                    question_info[q_num] = error_result
+        
+        return question_info
+    except Exception as e:
+        print(f"Error in extract_question_info: {str(e)}")
+        raise
 
 def generate_teaching_points(question_info_60_79, question_info_80_plus):
     """Generate key teaching points based on question summaries."""
