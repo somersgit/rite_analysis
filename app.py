@@ -12,11 +12,8 @@ from pathlib import Path
 
 load_dotenv()
 
-# Initialize OpenAI client with minimal configuration
-client = OpenAI(
-    api_key=os.getenv('OPENAI_API_KEY'),
-    base_url="https://api.openai.com/v1"
-)
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Cache configuration
 CACHE_DIR = Path('cache')
