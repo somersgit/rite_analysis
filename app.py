@@ -401,40 +401,51 @@ def extract_question_info(pdf_path, question_numbers):
 
 def generate_teaching_points(question_info_60_79, question_info_80_plus):
     """Generate key teaching points based on question summaries."""
-    # Combine all summaries
-    all_summaries = []
-    for questions in [question_info_60_79, question_info_80_plus]:
-        for info in questions.values():
-            if isinstance(info, dict) and 'summary' in info:
-                all_summaries.append(info['summary'])
-    
-    if not all_summaries:
-        return []
+    try:
+        # Combine all summaries
+        all_summaries = []
+        for questions in [question_info_60_79, question_info_80_plus]:
+            for info in questions.values():
+                if isinstance(info, dict) and 'summary' in info:
+                    all_summaries.append(info['summary'])
+        
+        if not all_summaries:
+            return "No valid summaries found to generate teaching points."
 
-    prompt = f"""As a chief resident, analyze these question summaries from commonly missed RITE exam questions and provide key teaching points. Focus on:
+        # Limit the number of summaries to prevent token overflow
+        all_summaries = all_summaries[:20]  # Take only first 20 summaries
+        summary_text = ' '.join(all_summaries)
+        if len(summary_text) > 4000:  # Truncate if too long
+            summary_text = summary_text[:4000] + "..."
+
+        prompt = f"""Analyze these commonly missed RITE exam questions and provide key teaching points. Focus on:
 1. Common themes and patterns
 2. Critical knowledge gaps
 3. High-yield topics for resident education
-4. Practical teaching strategies
 
-Summaries to analyze:
-{' '.join(all_summaries)}
+Provide 3-5 key teaching points."""
 
-Provide a concise, bullet-pointed list of 5-7 key teaching points that would be most valuable for chief residents."""
-
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=500
-        )
-        
-        teaching_points = response.choices[0].message.content.strip()
-        return teaching_points
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a chief resident creating teaching points from exam analysis."},
+                    {"role": "user", "content": prompt + "\n\nSummaries: " + summary_text}
+                ],
+                temperature=0.7,
+                max_tokens=300,
+                timeout=30  # 30 second timeout
+            )
+            
+            teaching_points = response.choices[0].message.content.strip()
+            return teaching_points if teaching_points else "Unable to generate teaching points."
+        except Exception as e:
+            print(f"Error in OpenAI API call: {str(e)}")
+            return "Error generating teaching points. Please try again."
+            
     except Exception as e:
-        print(f"Error generating teaching points: {str(e)}")
-        return "Error generating teaching points. Please try again."
+        print(f"Error in generate_teaching_points: {str(e)}")
+        return "Error processing teaching points."
 
 @app.route('/')
 def index():
@@ -471,15 +482,17 @@ def analyze():
                 return jsonify({'error': 'No questions found with high error rates'}), 400
             
             question_info = extract_question_info(manual_path, all_questions)
+            
+            # Validate question_info
             if not isinstance(question_info, dict):
                 return jsonify({'error': 'Invalid question information format'}), 500
             
-            questions_60_79 = {q: question_info[q] for q in high_error_questions['60-79']}
-            questions_80_plus = {q: question_info[q] for q in high_error_questions['80+']}
+            questions_60_79 = {str(q): question_info.get(q, {}) for q in high_error_questions['60-79']}
+            questions_80_plus = {str(q): question_info.get(q, {}) for q in high_error_questions['80+']}
             
             teaching_points = generate_teaching_points(questions_60_79, questions_80_plus)
             
-            # Initialize statistics
+            # Initialize statistics with default values
             stats = {
                 'subcategory_stats': {'60-79': {}, '80+': {}},
                 'general_category_stats': {'60-79': {}, '80+': {}},
@@ -488,23 +501,21 @@ def analyze():
             
             # Process categories for both ranges
             for range_key in ['60-79', '80+']:
-                questions = high_error_questions[range_key]
-                for q_num in questions:
-                    if q_num in question_info and isinstance(question_info[q_num], dict):
-                        info = question_info[q_num]
-                        
+                questions = questions_60_79 if range_key == '60-79' else questions_80_plus
+                for q_info in questions.values():
+                    if isinstance(q_info, dict):
                         # Subcategory statistics
-                        if info.get('subcategory'):
-                            stats['subcategory_stats'][range_key][info['subcategory']] = \
-                                stats['subcategory_stats'][range_key].get(info['subcategory'], 0) + 1
+                        if q_info.get('subcategory'):
+                            stats['subcategory_stats'][range_key][q_info['subcategory']] = \
+                                stats['subcategory_stats'][range_key].get(q_info['subcategory'], 0) + 1
                         
                         # General category statistics
-                        if info.get('general_category'):
-                            stats['general_category_stats'][range_key][info['general_category']] = \
-                                stats['general_category_stats'][range_key].get(info['general_category'], 0) + 1
+                        if q_info.get('general_category'):
+                            stats['general_category_stats'][range_key][q_info['general_category']] = \
+                                stats['general_category_stats'][range_key].get(q_info['general_category'], 0) + 1
                         
                         # Population statistics
-                        category = info.get('category', '')
+                        category = q_info.get('category', '')
                         pop_type = 'Adult' if 'ADULT' in category else 'Pediatric' if 'PEDIATRIC' in category else 'Not Specified'
                         stats['population_stats'][range_key][pop_type] = \
                             stats['population_stats'][range_key].get(pop_type, 0) + 1
@@ -522,9 +533,7 @@ def analyze():
                 'questions_80_plus': questions_80_plus
             }
             
-            # Validate the result before sending
-            json.dumps(result)  # This will raise an error if the result is not JSON-serializable
-            
+            # Ensure the result is JSON-serializable
             return jsonify(result)
             
         except Exception as e:
