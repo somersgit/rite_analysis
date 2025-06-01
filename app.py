@@ -1,7 +1,6 @@
 import os
 from flask import Flask, render_template, request, jsonify
 import PyPDF2
-import tabula
 import pandas as pd
 from openai import OpenAI
 from dotenv import load_dotenv
